@@ -1,3 +1,185 @@
+<?php
+session_start();
+if (!isset($_SESSION['logged'])) {
+    header("Location: login.php");
+    exit();
+}
+include 'connessione.php';
+
+// Handle booking actions
+if (isset($_GET['action']) && isset($_GET['id'])) {
+    $id = intval($_GET['id']);
+    if ($_GET['action'] === 'confirm') {
+        // Check if 'stato' column exists, if not use a default status system
+        $result = $conn->query("SHOW COLUMNS FROM prenotazioni LIKE 'stato'");
+        if ($result->num_rows > 0) {
+            $conn->query("UPDATE prenotazioni SET stato = 'Confermata' WHERE id = $id");
+        } else {
+            // If no stato column, we'll just mark it somehow or create the column
+            $conn->query("ALTER TABLE prenotazioni ADD COLUMN stato VARCHAR(50) DEFAULT 'In attesa'");
+            $conn->query("UPDATE prenotazioni SET stato = 'Confermata' WHERE id = $id");
+        }
+    } elseif ($_GET['action'] === 'cancel') {
+        $result = $conn->query("SHOW COLUMNS FROM prenotazioni LIKE 'stato'");
+        if ($result->num_rows > 0) {
+            $conn->query("UPDATE prenotazioni SET stato = 'Cancellata' WHERE id = $id");
+        } else {
+            $conn->query("ALTER TABLE prenotazioni ADD COLUMN stato VARCHAR(50) DEFAULT 'In attesa'");
+            $conn->query("UPDATE prenotazioni SET stato = 'Cancellata' WHERE id = $id");
+        }
+    }
+    header("Location: admin.php");
+    exit();
+}
+
+// Handle add service
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_service'])) {
+    $nome = $conn->real_escape_string(trim($_POST['nome_servizio']));
+    $prezzo = floatval($_POST['prezzo_servizio']);
+    if ($nome !== '' && $prezzo > 0) {
+        // Check if servizi table exists and has the right columns
+        $result = $conn->query("SHOW TABLES LIKE 'servizi'");
+        if ($result->num_rows == 0) {
+            // Create servizi table if it doesn't exist
+            $conn->query("CREATE TABLE servizi (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                nome VARCHAR(255) NOT NULL,
+                prezzo DECIMAL(10,2) NOT NULL
+            )");
+        }
+        $conn->query("INSERT INTO servizi (nome, prezzo) VALUES ('$nome', $prezzo)");
+        header("Location: admin.php");
+        exit();
+    } else {
+        $error_message = "Inserisci un nome valido e un prezzo maggiore di 0.";
+    }
+}
+
+// Handle clear bookings
+if (isset($_POST['clear_prenotazioni'])) {
+    // Check if storico_ricavi table exists
+    $result = $conn->query("SHOW TABLES LIKE 'storico_ricavi'");
+    if ($result->num_rows == 0) {
+        $conn->query("CREATE TABLE storico_ricavi (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            data DATE NOT NULL UNIQUE,
+            ricavo DECIMAL(10,2) NOT NULL DEFAULT 0
+        )");
+    }
+
+    // Check if we have the necessary columns and tables
+    $servizi_exists = $conn->query("SHOW TABLES LIKE 'servizi'")->num_rows > 0;
+    $stato_exists = $conn->query("SHOW COLUMNS FROM prenotazioni LIKE 'stato'")->num_rows > 0;
+    
+    if ($servizi_exists && $stato_exists) {
+        $ricavi_query = $conn->query("
+            SELECT p.data_prenotazione, SUM(s.prezzo) as totale
+            FROM prenotazioni p 
+            JOIN servizi s ON p.servizio = s.nome
+            WHERE p.stato = 'Confermata'
+            GROUP BY p.data_prenotazione
+        ");
+
+        if ($ricavi_query) {
+            while ($row = $ricavi_query->fetch_assoc()) {
+                $data = $conn->real_escape_string($row['data_prenotazione']);
+                $totale = floatval($row['totale']);
+                $conn->query("
+                    INSERT INTO storico_ricavi (data, ricavo)
+                    VALUES ('$data', $totale)
+                    ON DUPLICATE KEY UPDATE ricavo = ricavo + VALUES(ricavo)
+                ");
+            }
+        }
+    }
+
+    $conn->query("TRUNCATE TABLE prenotazioni");
+    header("Location: admin.php");
+    exit();
+}
+
+// Get statistics - with error handling
+$statistiche = ['Confermata' => 0, 'In attesa' => 0, 'Cancellata' => 0];
+
+// Check if stato column exists
+$stato_exists = $conn->query("SHOW COLUMNS FROM prenotazioni LIKE 'stato'")->num_rows > 0;
+
+if ($stato_exists) {
+    $totali = $conn->query("SELECT stato, COUNT(*) as totale FROM prenotazioni GROUP BY stato");
+    if ($totali) {
+        while ($row = $totali->fetch_assoc()) {
+            $statistiche[$row['stato']] = $row['totale'];
+        }
+    }
+} else {
+    // If no stato column, just count total bookings
+    $total_result = $conn->query("SELECT COUNT(*) as totale FROM prenotazioni");
+    if ($total_result) {
+        $total_row = $total_result->fetch_assoc();
+        $statistiche['In attesa'] = $total_row['totale'];
+    }
+}
+
+// Get recent bookings
+$prenotazioni_query = "SELECT * FROM prenotazioni ORDER BY ";
+// Check if we have data_prenotazione column
+$data_col_exists = $conn->query("SHOW COLUMNS FROM prenotazioni LIKE 'data_prenotazione'")->num_rows > 0;
+if ($data_col_exists) {
+    $prenotazioni_query .= "data_prenotazione DESC, ";
+}
+$prenotazioni_query .= "id DESC LIMIT 10";
+
+$prenotazioni = $conn->query($prenotazioni_query);
+
+// Calculate total revenue
+$totale_ricavi = 0;
+$servizi_exists = $conn->query("SHOW TABLES LIKE 'servizi'")->num_rows > 0;
+
+if ($servizi_exists && $stato_exists) {
+    $entrate = $conn->query("SELECT SUM(s.prezzo) as totale FROM prenotazioni p JOIN servizi s ON p.servizio = s.nome WHERE p.stato = 'Confermata'");
+    if ($entrate) {
+        $entrate_row = $entrate->fetch_assoc();
+        $totale_ricavi = $entrate_row['totale'] ?? 0;
+    }
+}
+
+// Get revenue data
+$ricavi_tutti_giorni = [];
+
+// Check if storico_ricavi exists
+$storico_exists = $conn->query("SHOW TABLES LIKE 'storico_ricavi'")->num_rows > 0;
+if ($storico_exists) {
+    $result_storico = $conn->query("SELECT data, ricavo FROM storico_ricavi");
+    if ($result_storico) {
+        while ($row = $result_storico->fetch_assoc()) {
+            $ricavi_tutti_giorni[$row['data']] = floatval($row['ricavo']);
+        }
+    }
+}
+
+if ($servizi_exists && $stato_exists && $data_col_exists) {
+    $result_ricavi = $conn->query("
+        SELECT p.data_prenotazione, SUM(s.prezzo) as totale
+        FROM prenotazioni p 
+        JOIN servizi s ON p.servizio = s.nome
+        WHERE p.stato = 'Confermata'
+        GROUP BY p.data_prenotazione
+    ");
+    if ($result_ricavi) {
+        while ($row = $result_ricavi->fetch_assoc()) {
+            $data = $row['data_prenotazione'];
+            $totale = floatval($row['totale']);
+            if (isset($ricavi_tutti_giorni[$data])) {
+                $ricavi_tutti_giorni[$data] += $totale;
+            } else {
+                $ricavi_tutti_giorni[$data] = $totale;
+            }
+        }
+    }
+}
+
+krsort($ricavi_tutti_giorni);
+?>
 <!DOCTYPE html>
 <html lang="it">
 <head>
@@ -458,24 +640,25 @@
             box-shadow: 0 8px 25px rgba(0, 0, 0, 0.2);
         }
 
-        /* Report Section */
-        .report-section {
-            margin-top: 2rem;
-        }
-
-        .report-controls {
-            display: flex;
-            align-items: center;
-            gap: 1rem;
-            margin-bottom: 1rem;
-        }
-
-        .report-controls select {
-            padding: 0.8rem 1rem;
-            background: rgba(255, 255, 255, 0.08);
-            border: 1px solid rgba(255, 255, 255, 0.15);
+        /* Error Messages */
+        .error-message {
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            color: #f87171;
+            padding: 1rem;
             border-radius: 8px;
-            color: #ffffff;
+            margin-bottom: 1rem;
+            font-size: 0.9rem;
+        }
+
+        /* Success Messages */
+        .success-message {
+            background: rgba(34, 197, 94, 0.1);
+            border: 1px solid rgba(34, 197, 94, 0.3);
+            color: #4ade80;
+            padding: 1rem;
+            border-radius: 8px;
+            margin-bottom: 1rem;
             font-size: 0.9rem;
         }
 
@@ -541,123 +724,9 @@
                 display: none;
             }
         }
-
-        /* Error Messages */
-        .error-message {
-            background: rgba(239, 68, 68, 0.1);
-            border: 1px solid rgba(239, 68, 68, 0.3);
-            color: #f87171;
-            padding: 1rem;
-            border-radius: 8px;
-            margin-bottom: 1rem;
-            font-size: 0.9rem;
-        }
-
-        /* Success Messages */
-        .success-message {
-            background: rgba(34, 197, 94, 0.1);
-            border: 1px solid rgba(34, 197, 94, 0.3);
-            color: #4ade80;
-            padding: 1rem;
-            border-radius: 8px;
-            margin-bottom: 1rem;
-            font-size: 0.9rem;
-        }
     </style>
 </head>
 <body>
-<?php
-session_start();
-if (!isset($_SESSION['logged'])) {
-    header("Location: login.php");
-    exit();
-}
-include 'connessione.php';
-
-if (isset($_GET['action']) && isset($_GET['id'])) {
-    $id = intval($_GET['id']);
-    if ($_GET['action'] === 'confirm') {
-        $conn->query("UPDATE prenotazioni SET stato = 'Confermata' WHERE id = $id");
-    } elseif ($_GET['action'] === 'cancel') {
-        $conn->query("UPDATE prenotazioni SET stato = 'Cancellata' WHERE id = $id");
-    }
-    header("Location: admin.php");
-    exit();
-}
-
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_service'])) {
-    $nome = $conn->real_escape_string(trim($_POST['nome_servizio']));
-    $prezzo = floatval($_POST['prezzo_servizio']);
-    if ($nome !== '' && $prezzo > 0) {
-        $conn->query("INSERT INTO servizi (nome, prezzo) VALUES ('$nome', $prezzo)");
-        header("Location: admin.php");
-        exit();
-    } else {
-        $error_message = "Inserisci un nome valido e un prezzo maggiore di 0.";
-    }
-}
-
-if (isset($_POST['clear_prenotazioni'])) {
-    $ricavi_query = $conn->query("
-        SELECT p.data_prenotazione, SUM(s.prezzo) as totale
-        FROM prenotazioni p 
-        JOIN servizi s ON p.servizio = s.nome
-        WHERE p.stato = 'Confermata'
-        GROUP BY p.data_prenotazione
-    ");
-
-    while ($row = $ricavi_query->fetch_assoc()) {
-        $data = $conn->real_escape_string($row['data_prenotazione']);
-        $totale = floatval($row['totale']);
-        $conn->query("
-            INSERT INTO storico_ricavi (data, ricavo)
-            VALUES ('$data', $totale)
-            ON DUPLICATE KEY UPDATE ricavo = ricavo + VALUES(ricavo)
-        ");
-    }
-
-    $conn->query("TRUNCATE TABLE prenotazioni");
-    header("Location: admin.php");
-    exit();
-}
-
-$totali = $conn->query("SELECT stato, COUNT(*) as totale FROM prenotazioni GROUP BY stato");
-$statistiche = ['Confermata' => 0, 'In attesa' => 0, 'Cancellata' => 0];
-while ($row = $totali->fetch_assoc()) {
-    $statistiche[$row['stato']] = $row['totale'];
-}
-
-$prenotazioni = $conn->query("SELECT * FROM prenotazioni ORDER BY data_prenotazione DESC, orario DESC LIMIT 10");
-
-$entrate = $conn->query("SELECT SUM(s.prezzo) as totale FROM prenotazioni p JOIN servizi s ON p.servizio = s.nome WHERE p.stato = 'Confermata'");
-$totale_ricavi = $entrate->fetch_assoc()['totale'] ?? 0;
-
-$ricavi_tutti_giorni = [];
-
-$result_storico = $conn->query("SELECT data, ricavo FROM storico_ricavi");
-while ($row = $result_storico->fetch_assoc()) {
-    $ricavi_tutti_giorni[$row['data']] = floatval($row['ricavo']);
-}
-
-$result_ricavi = $conn->query("
-    SELECT p.data_prenotazione, SUM(s.prezzo) as totale
-    FROM prenotazioni p 
-    JOIN servizi s ON p.servizio = s.nome
-    WHERE p.stato = 'Confermata'
-    GROUP BY p.data_prenotazione
-");
-while ($row = $result_ricavi->fetch_assoc()) {
-    $data = $row['data_prenotazione'];
-    $totale = floatval($row['totale']);
-    if (isset($ricavi_tutti_giorni[$data])) {
-        $ricavi_tutti_giorni[$data] += $totale;
-    } else {
-        $ricavi_tutti_giorni[$data] = $totale;
-    }
-}
-
-krsort($ricavi_tutti_giorni);
-?>
 
 <button class="mobile-menu-btn" onclick="toggleSidebar()">
     <i class="fas fa-bars"></i>
@@ -724,85 +793,103 @@ krsort($ricavi_tutti_giorni);
                         <tr>
                             <th>#</th>
                             <th>Cliente</th>
+                            <?php if ($data_col_exists): ?>
                             <th>Data</th>
+                            <?php endif; ?>
                             <th>Ora</th>
                             <th>Servizio</th>
+                            <?php if ($stato_exists): ?>
                             <th>Stato</th>
                             <th>Azioni</th>
+                            <?php endif; ?>
                         </tr>
                     </thead>
                     <tbody>
-                        <?php $i = 1; while ($row = $prenotazioni->fetch_assoc()): ?>
-                        <tr>
-                            <td><?php echo $i++; ?></td>
-                            <td><?php echo htmlspecialchars($row['nome']); ?></td>
-                            <td>
-                                <?php 
-                                $data = date_create($row['data_prenotazione']);
-                                echo $data ? date_format($data, 'd/m/Y') : '';
-                                ?>
-                            </td>
-                            <td><?php echo date('H:i', strtotime($row['orario'])); ?></td>
-                            <td><?php echo htmlspecialchars($row['servizio']); ?></td>
-                            <td>
-                                <span class="status <?php 
-                                    if ($row['stato'] === 'Confermata') echo 'confermata'; 
-                                    elseif ($row['stato'] === 'In attesa') echo 'in-attesa'; 
-                                    elseif ($row['stato'] === 'Cancellata') echo 'cancellata'; 
-                                ?>">
-                                    <?php echo htmlspecialchars($row['stato']); ?>
-                                </span>
-                            </td>
-                            <td>
-                                <a href="?action=confirm&id=<?php echo $row['id']; ?>" 
-                                   class="action-btn confirm" 
-                                   onclick="return confirm('Confermare questa prenotazione?')">
-                                    <i class="fas fa-check"></i>Conferma
-                                </a>
-                                <a href="?action=cancel&id=<?php echo $row['id']; ?>" 
-                                   class="action-btn cancel" 
-                                   onclick="return confirm('Cancellare questa prenotazione?')">
-                                    <i class="fas fa-times"></i>Cancella
-                                </a>
-                            </td>
-                        </tr>
-                        <?php endwhile; ?>
+                        <?php if ($prenotazioni && $prenotazioni->num_rows > 0): ?>
+                            <?php $i = 1; while ($row = $prenotazioni->fetch_assoc()): ?>
+                            <tr>
+                                <td><?php echo $i++; ?></td>
+                                <td><?php echo htmlspecialchars($row['nome'] ?? 'N/A'); ?></td>
+                                <?php if ($data_col_exists): ?>
+                                <td>
+                                    <?php 
+                                    if (isset($row['data_prenotazione']) && $row['data_prenotazione']) {
+                                        $data = date_create($row['data_prenotazione']);
+                                        echo $data ? date_format($data, 'd/m/Y') : 'N/A';
+                                    } else {
+                                        echo 'N/A';
+                                    }
+                                    ?>
+                                </td>
+                                <?php endif; ?>
+                                <td><?php echo isset($row['orario']) ? date('H:i', strtotime($row['orario'])) : 'N/A'; ?></td>
+                                <td><?php echo htmlspecialchars($row['servizio'] ?? 'N/A'); ?></td>
+                                <?php if ($stato_exists): ?>
+                                <td>
+                                    <span class="status <?php 
+                                        $stato = $row['stato'] ?? 'In attesa';
+                                        if ($stato === 'Confermata') echo 'confermata'; 
+                                        elseif ($stato === 'In attesa') echo 'in-attesa'; 
+                                        elseif ($stato === 'Cancellata') echo 'cancellata'; 
+                                    ?>">
+                                        <?php echo htmlspecialchars($stato); ?>
+                                    </span>
+                                </td>
+                                <td>
+                                    <a href="?action=confirm&id=<?php echo $row['id']; ?>" 
+                                       class="action-btn confirm" 
+                                       onclick="return confirm('Confermare questa prenotazione?')">
+                                        <i class="fas fa-check"></i>Conferma
+                                    </a>
+                                    <a href="?action=cancel&id=<?php echo $row['id']; ?>" 
+                                       class="action-btn cancel" 
+                                       onclick="return confirm('Cancellare questa prenotazione?')">
+                                        <i class="fas fa-times"></i>Cancella
+                                    </a>
+                                </td>
+                                <?php endif; ?>
+                            </tr>
+                            <?php endwhile; ?>
+                        <?php else: ?>
+                            <tr>
+                                <td colspan="<?php echo $stato_exists ? '7' : '4'; ?>" style="text-align: center; color: #a0a0a0;">
+                                    Nessuna prenotazione trovata
+                                </td>
+                            </tr>
+                        <?php endif; ?>
                     </tbody>
                 </table>
             </div>
         </div>
 
-        <div class="content-card report-section">
+        <div class="content-card">
             <h3><i class="fas fa-chart-line"></i>Report Ricavi</h3>
-            <div class="report-controls">
-                <label for="selectData">Seleziona giorno:</label>
-                <select id="selectData">
-                    <?php 
-                    $dates_sorted = array_keys($ricavi_tutti_giorni);
-                    sort($dates_sorted);
-                    foreach ($dates_sorted as $date):
-                    ?>
-                    <option value="<?php echo $date; ?>"><?php echo date('d/m/Y', strtotime($date)); ?></option>
-                    <?php endforeach; ?>
-                </select>
-            </div>
-            <div class="table-container">
-                <table id="reportTable">
-                    <thead>
-                        <tr><th>Data</th><th>Ricavi</th></tr>
-                    </thead>
-                    <tbody>
-                        <tr>
+            <?php if (!empty($ricavi_tutti_giorni)): ?>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr><th>Data</th><th>Ricavi</th></tr>
+                        </thead>
+                        <tbody>
                             <?php 
-                            $firstDate = $dates_sorted[0] ?? null;
-                            $firstRevenue = $firstDate ? $ricavi_tutti_giorni[$firstDate] : 0;
+                            $count = 0;
+                            foreach ($ricavi_tutti_giorni as $data => $ricavo): 
+                                if ($count >= 5) break; // Show only last 5 days
+                                $count++;
                             ?>
-                            <td><?php echo $firstDate ? date('d/m/Y', strtotime($firstDate)) : ''; ?></td>
-                            <td>€<?php echo number_format($firstRevenue, 2); ?></td>
-                        </tr>
-                    </tbody>
-                </table>
-            </div>
+                            <tr>
+                                <td><?php echo date('d/m/Y', strtotime($data)); ?></td>
+                                <td>€<?php echo number_format($ricavo, 2); ?></td>
+                            </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            <?php else: ?>
+                <p style="color: #a0a0a0; text-align: center; padding: 2rem;">
+                    Nessun dato sui ricavi disponibile
+                </p>
+            <?php endif; ?>
         </div>
     </div>
 
@@ -860,29 +947,6 @@ krsort($ricavi_tutti_giorni);
             const toggleIcon = document.querySelector('.sidebar-toggle i');
             toggleIcon.className = sidebarCollapsed ? 'fas fa-chevron-right' : 'fas fa-chevron-left';
         }
-    }
-
-    // Report functionality
-    const selectData = document.getElementById('selectData');
-    const reportTableBody = document.querySelector('#reportTable tbody');
-
-    if (selectData && reportTableBody) {
-        selectData.addEventListener('change', () => {
-            const selectedDate = selectData.value;
-            fetch('ricavi_giornalieri.php?data=' + selectedDate)
-                .then(response => response.json())
-                .then(data => {
-                    reportTableBody.innerHTML = `
-                        <tr>
-                            <td>${data.data_formattata}</td>
-                            <td>€${data.ricavo.toFixed(2)}</td>
-                        </tr>
-                    `;
-                })
-                .catch(error => {
-                    console.error('Errore nel caricamento dei dati:', error);
-                });
-        });
     }
 
     // Close mobile sidebar when clicking outside
